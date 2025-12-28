@@ -46,12 +46,26 @@ chart.setMarket('BINANCE:BTCEUR', {
 });
 
 (async () => {
-  const indicList = await TradingView.getPrivateIndicators(process.argv[2]);
+  const debug = argv.includes('--debug');
 
-  if (!indicList.length) {
-    console.error('Your account has no private indicators');
+  // Use the SESSION and SIGNATURE we resolved earlier to fetch private indicators
+  if (debug) console.log('Using SESSION (len):', SESSION ? SESSION.length : 0, 'SIGNATURE (len):', SIGNATURE ? SIGNATURE.length : 0);
+
+  const indicList = await TradingView.getPrivateIndicators(SESSION, SIGNATURE);
+
+  if (!indicList || !indicList.length) {
+    console.error('Your account has no private indicators or the provided credentials are invalid.');
+    if (debug) console.error('Returned list:', JSON.stringify(indicList, null, 2));
     process.exit(0);
   }
+
+  if (debug) {
+    console.log(`Found ${indicList.length} private indicator(s):`);
+    indicList.forEach((i, idx) => console.log(`#${idx + 1}: id=${i.id} name='${i.name}' access=${i.access}`));
+  }
+
+  // If --list-only was passed, just print the list and exit
+  if (argv.includes('--list-only')) process.exit(0);
 
   for (const indic of indicList) {
     const privateIndic = await indic.get();
