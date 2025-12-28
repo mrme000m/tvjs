@@ -191,6 +191,11 @@ declare namespace TradingView {
     onData(callback: (...data: any[]) => void): () => void;
     onError(callback: (error: Error, ...msgs: any[]) => void): () => void;
     onEvent(callback: (event: string, ...data: any[]) => void): () => void;
+    onLog(callback: (...data: any[]) => void): () => void;
+    onReconnecting(callback: (attempts: number, maxAttempts: number) => void): () => void;
+    onReconnected(callback: () => void): () => void;
+    onReconnectFailed(callback: () => void): () => void;
+    onPingTimeout(callback: () => void): () => void;
 
     send(type: string, params?: any[]): void;
     sendQueue(): void;

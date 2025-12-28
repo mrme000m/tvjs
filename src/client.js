@@ -32,7 +32,8 @@ const chartSessionGenerator = require('./chart/session');
 /**
  * @typedef { 'connected' | 'disconnected'
  *  | 'logged' | 'ping' | 'data'
- *  | 'error' | 'event'
+ *  | 'error' | 'event' | 'log'
+ *  | 'reconnecting' | 'reconnected' | 'reconnectFailed' | 'pingTimeout'
  * } ClientEvent
  */
 
@@ -74,9 +75,13 @@ module.exports = class Client {
     logged: [],
     ping: [],
     data: [],
-
+    log: [],
     error: [],
     event: [],
+    reconnecting: [],
+    reconnected: [],
+    reconnectFailed: [],
+    pingTimeout: [],
   };
 
   /** @param {ClientEvent} ev */
@@ -186,11 +191,61 @@ module.exports = class Client {
     return () => this.#removeCallback('event', cb);
   }
 
+  /**
+   * When a log message is emitted
+   * @param {(...{}) => void} cb Callback
+   * @event onLog
+   */
+  onLog(cb) {
+    this.#callbacks.log.push(cb);
+    return () => this.#removeCallback('log', cb);
+  }
+
+  /**
+   * When the client is reconnecting
+   * @param {(attempts: number, maxAttempts: number) => void} cb Callback
+   * @event onReconnecting
+   */
+  onReconnecting(cb) {
+    this.#callbacks.reconnecting.push(cb);
+    return () => this.#removeCallback('reconnecting', cb);
+  }
+
+  /**
+   * When the client has reconnected
+   * @param {() => void} cb Callback
+   * @event onReconnected
+   */
+  onReconnected(cb) {
+    this.#callbacks.reconnected.push(cb);
+    return () => this.#removeCallback('reconnected', cb);
+  }
+
+  /**
+   * When the client has failed to reconnect
+   * @param {() => void} cb Callback
+   * @event onReconnectFailed
+   */
+  onReconnectFailed(cb) {
+    this.#callbacks.reconnectFailed.push(cb);
+    return () => this.#removeCallback('reconnectFailed', cb);
+  }
+
+  /**
+   * When the client has not received a pong from the server in time
+   * @param {() => void} cb Callback
+   * @event onPingTimeout
+   */
+  onPingTimeout(cb) {
+    this.#callbacks.pingTimeout.push(cb);
+    return () => this.#removeCallback('pingTimeout', cb);
+  }
+
   #parsePacket(str) {
     if (!this.isOpen) return;
 
     protocol.parseWSPacket(str).forEach((packet) => {
-      if (isDebugEnabled()) console.log('§90§30§107 CLIENT §0 PACKET', packet);
+      if (isDebugEnabled()) this.#handleEvent('log', 'CLIENT', 'PACKET', packet);
       if (typeof packet === 'number') { // Ping
         this.#ws.send(protocol.formatWSPacket(`~h~${packet}`));
         this.#handleEvent('ping', packet);
@@ -245,7 +300,7 @@ module.exports = class Client {
     while (this.isOpen && this.#logged && this.#sendQueue.length > 0) {
       const packet = this.#sendQueue.shift();
       this.#ws.send(packet);
-      if (isDebugEnabled()) console.log('§90§30§107 > §0', packet);
+      if (isDebugEnabled()) this.#handleEvent('log', '>', packet);
     }
   }
 
@@ -267,6 +322,10 @@ module.exports = class Client {
     // Support legacy DEBUG option (uppercase)
     if (clientOptions.DEBUG !== undefined) setDebug(clientOptions.DEBUG);
 
+    this.#connect(clientOptions);
+  }
+
+  #connect(clientOptions) {
     const server = clientOptions.server || 'data';
 
     // Create WebSocket with connection timeout
@@ -332,14 +391,14 @@ module.exports = class Client {
       // Implement retry logic
       if (!this.#isShuttingDown && this.#reconnectAttempts < this.#maxReconnectAttempts) {
         this.#reconnectAttempts++;
-        console.log(`Attempting to reconnect (${this.#reconnectAttempts}/${this.#maxReconnectAttempts})...`);
+        this.#handleEvent('reconnecting', this.#reconnectAttempts, this.#maxReconnectAttempts);
 
         setTimeout(() => {
-          console.log('Reconnecting...');
+          this.#handleEvent('log', 'Reconnecting...');
           this.#reconnect(clientOptions);
         }, this.#reconnectDelay);
       } else {
-        console.log('Max reconnection attempts reached or client is shutting down.');
+        this.#handleEvent('reconnectFailed');
       }
     });
 
@@ -358,87 +417,8 @@ module.exports = class Client {
   #reconnect(clientOptions) {
     if (this.#isShuttingDown) return;
 
-    console.log('Creating new WebSocket connection...');
-
-    const server = clientOptions.server || 'data';
-    this.#ws = new WebSocket(`wss://${server}.tradingview.com/socket.io/websocket?type=chart`, {
-      origin: 'https://www.tradingview.com',
-    });
-
-    // Set up connection timeout for reconnection
-    const connectionTimer = setTimeout(() => {
-      if (this.#ws.readyState === WebSocket.CONNECTING) {
-        this.#handleError('Reconnection timeout');
-        this.#ws.terminate();
-      }
-    }, this.#connectionTimeout);
-
-    this.#ws.on('open', () => {
-      // Clear connection timeout on successful connection
-      clearTimeout(connectionTimer);
-      this.#reconnectAttempts = 0; // Reset reconnect attempts on successful connection
-
-      // Handle authentication after connection is established
-      this.#authPromise = clientOptions.token
-        ? misc.getUser(
-          clientOptions.token,
-          clientOptions.signature ? clientOptions.signature : '',
-          clientOptions.location ? clientOptions.location : 'https://tradingview.com',
-        ).then((user) => ({
-          m: 'set_auth_token',
-          p: [user.authToken],
-        })).catch((err) => {
-          const authError = new AuthenticationError('Credentials error', err.message);
-          this.#handleError(authError, err.message);
-          throw authError;
-        })
-        : Promise.resolve({
-          m: 'set_auth_token',
-          p: ['unauthorized_user_token'],
-        });
-
-      this.#authPromise.then((authPacket) => {
-        if (this.#isShuttingDown) return;
-        this.#sendQueue.unshift(protocol.formatWSPacket(authPacket));
-        this.#logged = true;
-        this.#handleEvent('connected');
-        this.sendQueue();
-
-        // Start ping/pong health monitoring
-        this.#startPingMonitoring();
-      }).catch(() => {
-        // Error already handled in #authPromise
-        this.#ws.close();
-      });
-    });
-
-    this.#ws.on('close', (code, reason) => {
-      // Clear ping monitoring when connection closes
-      this.#stopPingMonitoring();
-
-      this.#logged = false;
-      this.#handleEvent('disconnected');
-
-      // Implement retry logic
-      if (!this.#isShuttingDown && this.#reconnectAttempts < this.#maxReconnectAttempts) {
-        this.#reconnectAttempts++;
-        console.log(`Attempting to reconnect (${this.#reconnectAttempts}/${this.#maxReconnectAttempts})...`);
-
-        setTimeout(() => {
-          console.log('Reconnecting...');
-          this.#reconnect(clientOptions);
-        }, this.#reconnectDelay);
-      } else {
-        console.log('Max reconnection attempts reached or client is shutting down.');
-      }
-    });
-
-    this.#ws.on('error', (err) => {
-      const error = new ConnectionError('WebSocket error', err.message);
-      this.#handleError(error, err.message);
-    });
-
-    this.#ws.on('message', (data) => this.#parsePacket(data));
+    this.#handleEvent('log', 'Creating new WebSocket connection...');
+    this.#connect(clientOptions);
   }
 
   /**
@@ -464,7 +444,7 @@ module.exports = class Client {
 
         this.#pingTimeout = setTimeout(() => {
           if (this.isOpen) {
-            console.log('Ping timeout - connection may be dead, attempting to close and reconnect');
+            this.#handleEvent('pingTimeout');
             this.#ws.terminate(); // Force close the connection
           }
         }, this.#pingTimeoutDuration);
@@ -478,7 +458,7 @@ module.exports = class Client {
       }
       this.#lastPingTime = Date.now();
       if (isDebugEnabled()) {
-        console.log('Received pong from server');
+        this.#handleEvent('log', 'Received pong from server');
       }
     });
 
@@ -528,11 +508,6 @@ module.exports = class Client {
       // Clean up all sessions before closing
       Object.keys(this.#sessions).forEach((sessionId) => {
         delete this.#sessions[sessionId];
-      });
-
-      // Clear all callbacks to prevent memory leaks
-      Object.keys(this.#callbacks).forEach((event) => {
-        this.#callbacks[event] = [];
       });
 
       // Clear send queue

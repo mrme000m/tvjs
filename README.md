@@ -26,6 +26,8 @@ Join the Telegram group of the TradingView-API Community: [t.me/tradingview_api]
 - [x] Automatic reconnection with configurable retry attempts
 - [x] Connection timeout handling
 - [x] Connection health monitoring with ping/pong
+- [x] Event-driven logging for connection status (`reconnecting`, `reconnected`, `reconnectFailed`)
+- [x] Ping timeout events for better connection management
 - [ ] TradingView socket server emulation
 - [ ] Interract with public chats
 - [ ] Get Screener top values
