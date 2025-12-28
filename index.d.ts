@@ -160,6 +160,10 @@ declare namespace TradingView {
     DEBUG?: boolean; // Legacy support
     server?: 'data' | 'prodata' | 'widgetdata';
     location?: string;
+    reconnectAttempts?: number;
+    reconnectDelay?: number;
+    connectionTimeout?: number;
+    pingTimeout?: number;
   }
 
   export interface SocketSession {

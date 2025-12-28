@@ -4,14 +4,35 @@ const TradingView = require('../main');
  * This example tests many types of errors
  */
 
-if (!process.env.SESSION || !process.env.SIGNATURE) {
-  throw Error('Please set your sessionid and signature cookies');
+// Report and continue on unhandled errors so tests don't abort
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason && reason.message ? reason.message : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err && err.message ? err.message : err);
+});
+
+// dotenv + CLI flags support
+try { require('dotenv').config(); } catch (e) {}
+const argv = process.argv.slice(2);
+let cliSession = null;
+let cliSignature = null;
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--session') { cliSession = argv[i + 1]; i++; }
+  else if (argv[i] === '--signature') { cliSignature = argv[i + 1]; i++; }
+}
+const SESSION = cliSession || process.env.SESSION;
+const SIGNATURE = cliSignature || process.env.SIGNATURE;
+
+if (!SESSION || !SIGNATURE) {
+  console.error('This example requires SESSION and SIGNATURE cookies. Provide them via .env or CLI: --session <SESSION> --signature <SIGNATURE>');
+  process.exit(1);
 }
 
 // Creates a websocket client
 const client = new TradingView.Client({
-  token: process.env.SESSION,
-  signature: process.env.SIGNATURE,
+  token: SESSION,
+  signature: SIGNATURE,
 });
 
 const tests = [

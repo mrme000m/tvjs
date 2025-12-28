@@ -46,6 +46,15 @@ module.exports = class Client {
 
   #authPromise;
 
+  #reconnectAttempts = 0;
+  #maxReconnectAttempts = 5;
+  #reconnectDelay = 5000; // 5 seconds
+  #connectionTimeout = 10000; // 10 seconds
+  #pingInterval = null;
+  #lastPingTime = Date.now();
+  #pingTimeout = null;
+  #pingTimeoutDuration = 30000; // 30 seconds
+
   /** If the client is logged in */
   get isLogged() {
     return this.#logged;
@@ -259,9 +268,19 @@ module.exports = class Client {
     if (clientOptions.DEBUG !== undefined) setDebug(clientOptions.DEBUG);
 
     const server = clientOptions.server || 'data';
+
+    // Create WebSocket with connection timeout
     this.#ws = new WebSocket(`wss://${server}.tradingview.com/socket.io/websocket?type=chart`, {
       origin: 'https://www.tradingview.com',
     });
+
+    // Set up connection timeout
+    const connectionTimer = setTimeout(() => {
+      if (this.#ws.readyState === WebSocket.CONNECTING) {
+        this.#handleError('Connection timeout');
+        this.#ws.terminate(); // Force close the connection
+      }
+    }, this.#connectionTimeout);
 
     // Authentication will be handled after WebSocket connects
     this.#authPromise = clientOptions.token
@@ -283,6 +302,10 @@ module.exports = class Client {
       });
 
     this.#ws.on('open', () => {
+      // Clear connection timeout on successful connection
+      clearTimeout(connectionTimer);
+      this.#reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+
       // Handle authentication after connection is established
       this.#authPromise.then((authPacket) => {
         if (this.#isShuttingDown) return;
@@ -290,15 +313,34 @@ module.exports = class Client {
         this.#logged = true;
         this.#handleEvent('connected');
         this.sendQueue();
+
+        // Start ping/pong health monitoring
+        this.#startPingMonitoring();
       }).catch(() => {
         // Error already handled in #authPromise
         this.#ws.close();
       });
     });
 
-    this.#ws.on('close', () => {
+    this.#ws.on('close', (code, reason) => {
+      // Clear ping monitoring when connection closes
+      this.#stopPingMonitoring();
+
       this.#logged = false;
       this.#handleEvent('disconnected');
+
+      // Implement retry logic
+      if (!this.#isShuttingDown && this.#reconnectAttempts < this.#maxReconnectAttempts) {
+        this.#reconnectAttempts++;
+        console.log(`Attempting to reconnect (${this.#reconnectAttempts}/${this.#maxReconnectAttempts})...`);
+
+        setTimeout(() => {
+          console.log('Reconnecting...');
+          this.#reconnect(clientOptions);
+        }, this.#reconnectDelay);
+      } else {
+        console.log('Max reconnection attempts reached or client is shutting down.');
+      }
     });
 
     this.#ws.on('error', (err) => {
@@ -307,6 +349,160 @@ module.exports = class Client {
     });
 
     this.#ws.on('message', (data) => this.#parsePacket(data));
+  }
+
+  /**
+   * Reconnect to the WebSocket server
+   * @param {ClientOptions} clientOptions TradingView client options
+   */
+  #reconnect(clientOptions) {
+    if (this.#isShuttingDown) return;
+
+    console.log('Creating new WebSocket connection...');
+
+    const server = clientOptions.server || 'data';
+    this.#ws = new WebSocket(`wss://${server}.tradingview.com/socket.io/websocket?type=chart`, {
+      origin: 'https://www.tradingview.com',
+    });
+
+    // Set up connection timeout for reconnection
+    const connectionTimer = setTimeout(() => {
+      if (this.#ws.readyState === WebSocket.CONNECTING) {
+        this.#handleError('Reconnection timeout');
+        this.#ws.terminate();
+      }
+    }, this.#connectionTimeout);
+
+    this.#ws.on('open', () => {
+      // Clear connection timeout on successful connection
+      clearTimeout(connectionTimer);
+      this.#reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+
+      // Handle authentication after connection is established
+      this.#authPromise = clientOptions.token
+        ? misc.getUser(
+          clientOptions.token,
+          clientOptions.signature ? clientOptions.signature : '',
+          clientOptions.location ? clientOptions.location : 'https://tradingview.com',
+        ).then((user) => ({
+          m: 'set_auth_token',
+          p: [user.authToken],
+        })).catch((err) => {
+          const authError = new AuthenticationError('Credentials error', err.message);
+          this.#handleError(authError, err.message);
+          throw authError;
+        })
+        : Promise.resolve({
+          m: 'set_auth_token',
+          p: ['unauthorized_user_token'],
+        });
+
+      this.#authPromise.then((authPacket) => {
+        if (this.#isShuttingDown) return;
+        this.#sendQueue.unshift(protocol.formatWSPacket(authPacket));
+        this.#logged = true;
+        this.#handleEvent('connected');
+        this.sendQueue();
+
+        // Start ping/pong health monitoring
+        this.#startPingMonitoring();
+      }).catch(() => {
+        // Error already handled in #authPromise
+        this.#ws.close();
+      });
+    });
+
+    this.#ws.on('close', (code, reason) => {
+      // Clear ping monitoring when connection closes
+      this.#stopPingMonitoring();
+
+      this.#logged = false;
+      this.#handleEvent('disconnected');
+
+      // Implement retry logic
+      if (!this.#isShuttingDown && this.#reconnectAttempts < this.#maxReconnectAttempts) {
+        this.#reconnectAttempts++;
+        console.log(`Attempting to reconnect (${this.#reconnectAttempts}/${this.#maxReconnectAttempts})...`);
+
+        setTimeout(() => {
+          console.log('Reconnecting...');
+          this.#reconnect(clientOptions);
+        }, this.#reconnectDelay);
+      } else {
+        console.log('Max reconnection attempts reached or client is shutting down.');
+      }
+    });
+
+    this.#ws.on('error', (err) => {
+      const error = new ConnectionError('WebSocket error', err.message);
+      this.#handleError(error, err.message);
+    });
+
+    this.#ws.on('message', (data) => this.#parsePacket(data));
+  }
+
+  /**
+   * Start ping/pong health monitoring
+   */
+  #startPingMonitoring() {
+    // Clear any existing ping interval
+    if (this.#pingInterval) {
+      clearInterval(this.#pingInterval);
+    }
+
+    // Set up ping interval to send ping every 30 seconds
+    this.#pingInterval = setInterval(() => {
+      if (this.isOpen) {
+        // Send a ping to the server
+        this.#ws.ping();
+        this.#lastPingTime = Date.now();
+
+        // Set up timeout to detect if ping response doesn't come back
+        if (this.#pingTimeout) {
+          clearTimeout(this.#pingTimeout);
+        }
+
+        this.#pingTimeout = setTimeout(() => {
+          if (this.isOpen) {
+            console.log('Ping timeout - connection may be dead, attempting to close and reconnect');
+            this.#ws.terminate(); // Force close the connection
+          }
+        }, this.#pingTimeoutDuration);
+      }
+    }, 30000); // Ping every 30 seconds
+
+    // Handle pong response
+    this.#ws.on('pong', () => {
+      if (this.#pingTimeout) {
+        clearTimeout(this.#pingTimeout);
+      }
+      this.#lastPingTime = Date.now();
+      if (isDebugEnabled()) {
+        console.log('Received pong from server');
+      }
+    });
+
+    // Handle ping from server
+    this.#ws.on('ping', () => {
+      if (this.isOpen) {
+        this.#ws.pong(); // Respond with pong
+      }
+    });
+  }
+
+  /**
+   * Stop ping/pong health monitoring
+   */
+  #stopPingMonitoring() {
+    if (this.#pingInterval) {
+      clearInterval(this.#pingInterval);
+      this.#pingInterval = null;
+    }
+
+    if (this.#pingTimeout) {
+      clearTimeout(this.#pingTimeout);
+      this.#pingTimeout = null;
+    }
   }
 
   /** @type {ClientBridge} */

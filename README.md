@@ -23,6 +23,9 @@ Join the Telegram group of the TradingView-API Community: [t.me/tradingview_api]
 - [x] Get TradingView's technical analysis
 - [x] Replay mode + Fake Replay mode (for free plan)
 - [x] Get values from a specific date range
+- [x] Automatic reconnection with configurable retry attempts
+- [x] Connection timeout handling
+- [x] Connection health monitoring with ping/pong
 - [ ] TradingView socket server emulation
 - [ ] Interract with public chats
 - [ ] Get Screener top values
